@@ -76,6 +76,7 @@ final class PulseModel: ObservableObject {
     @Published var thermAdvice: String = ""
     @Published var fanControlAvailable = false
     @Published var fanControlReason: String = ""
+    @Published var thermFanFloor: Int = 0
 
     // Render self-limit: drop the live desktop blur when hot (band ≥ 2) or on
     // battery. This is the app's own contribution to cooling the machine.
@@ -113,6 +114,7 @@ final class PulseModel: ObservableObject {
         let speed_limit: Int; let throttling: Bool
         let band: Int; let band_name: String
         let fan_control: Bool; let fan_reason: String
+        let fan_floor: Double?
         let hog: Hog; let advice: String
     }
 
@@ -133,6 +135,7 @@ final class PulseModel: ObservableObject {
             self.thermAdvice = t.advice
             self.fanControlAvailable = t.fan_control
             self.fanControlReason = t.fan_reason
+            self.thermFanFloor = Int((t.fan_floor ?? 0).rounded())
         }
     }
 
@@ -387,7 +390,7 @@ final class PulseModel: ObservableObject {
             let thermal = resourcePath("thermal")
             let smc = Bundle.main.path(forResource: "smc", ofType: nil) ?? "\(self.spool)/../smc"
             let r = runAdmin("/bin/zsh '\(core)' thermal-install '\(thermal)' '\(smc)'")
-            self.flash(r.code == 0 ? "Live °C sensor enabled" : "Sensor install canceled")
+            self.flash(r.code == 0 ? "Governor updated — fan verdict in ~15 s" : "Install canceled")
         }
     }
 
@@ -969,20 +972,36 @@ struct IslandView: View {
                     .foregroundColor(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
-            if model.thermCpuC == 0 {
-                Button { model.installThermal() } label: {
-                    Label("Enable live °C + fan sensor (one prompt)", systemImage: "thermometer.medium")
-                        .font(.system(size: 10, weight: .semibold))
-                        .foregroundColor(bandColor)
+            if model.fanControlAvailable {
+                // Root floor writes proven by read-back — multi-band control is LIVE.
+                Label(model.thermBand >= 1
+                        ? "Multi-band fan floor \(model.thermFanFloor) rpm — verified live"
+                        : "Multi-band fan floors armed — at base until warm",
+                      systemImage: "fanblades.fill")
+                    .font(.system(size: 9.5, weight: .semibold))
+                    .foregroundColor(bandColor.opacity(0.95))
+                    .labelStyle(.titleAndIcon)
+            } else {
+                if !model.thermAdvice.isEmpty || model.thermCpuC == 0 {
+                    Button { model.installThermal() } label: {
+                        Label(model.thermCpuC == 0
+                                ? "Enable live °C + fan sensor (one prompt)"
+                                : "Upgrade governor — verify root fan floors (one prompt)",
+                              systemImage: "fanblades")
+                            .font(.system(size: 10, weight: .semibold))
+                            .foregroundColor(bandColor)
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(model.busy != nil)
                 }
-                .buttonStyle(.plain)
-                .disabled(model.busy != nil)
+                Label(model.fanControlReason.isEmpty
+                        ? "Fans on Apple's curve until the governor verifies root control"
+                        : model.fanControlReason,
+                      systemImage: "lock.fill")
+                    .font(.system(size: 9, weight: .medium))
+                    .foregroundColor(.secondary.opacity(0.7))
+                    .labelStyle(.titleAndIcon)
             }
-            Label("Fans on Apple's curve — direct control blocked by the T2 on this model",
-                  systemImage: "lock.fill")
-                .font(.system(size: 9, weight: .medium))
-                .foregroundColor(.secondary.opacity(0.7))
-                .labelStyle(.titleAndIcon)
         }
         .padding(12)
         .frame(maxWidth: .infinity, alignment: .leading)

@@ -58,7 +58,11 @@ static int smc_read(const char *key, uint32_t *type, uint32_t *size, uint8_t *bu
     memset(&in,0,sizeof in);
     in.key = s2k(key); in.keyInfo.dataSize = out.keyInfo.dataSize; in.data8 = SMC_CMD_READ_BYTES;
     if(call(&in,&out) != kIOReturnSuccess || out.result) return 1;
-    memcpy(buf, out.bytes, out.keyInfo.dataSize);
+    // Copy using the size learned from READ_KEYINFO — the READ_BYTES response
+    // does not reliably echo keyInfo, and trusting it copies 0 bytes and
+    // decodes stale stack (which reads as 0.000 for every key).
+    if(*size > 32) *size = 32;
+    memcpy(buf, out.bytes, *size);
     return 0;
 }
 
@@ -119,6 +123,23 @@ int main(int argc, char **argv){
             printf(",\"f%d\":{\"rpm\":%.0f,\"min\":%.0f,\"max\":%.0f}", i, rd(a), rd(mn), rd(mx));
         }
         printf("}\n");
+    } else if(argc>=2 && !strcmp(argv[1],"tempraw")){
+        // plain "cpu gpu" for shell consumption
+        const char *keys[]={"TC0D","TC0E","TC0F","TC0P","TCXC","Tp09","Tp0T",0};
+        double best=-1; for(int i=0;keys[i];i++){ double v=rd(keys[i]); if(v>0&&v<125&&v>best) best=v; }
+        double g=rd("TG0D"); if(g<=0||g>125) g=rd("TGDD"); if(g<=0||g>125) g=rd("TG0P");
+        printf("%.1f %.1f\n", best>0?best:0, g>0?g:0);
+    } else if(argc>=3 && !strcmp(argv[1],"get")){
+        // bare numeric value, "nan" on failure — for shell arithmetic
+        uint32_t type,size; uint8_t buf[32];
+        if(smc_read(argv[2],&type,&size,buf)){ printf("nan\n"); rc=1; }
+        else printf("%.2f\n", decode(type,size,buf));
+    } else if(argc>=2 && !strcmp(argv[1],"fanstat")){
+        // one line per fan: "<idx> <rpm> <min> <max>" (invalid reads print -1)
+        for(int i=0;i<2;i++){
+            char a[5],mn[5],mx[5]; snprintf(a,5,"F%dAc",i); snprintf(mn,5,"F%dMn",i); snprintf(mx,5,"F%dMx",i);
+            printf("%d %.0f %.0f %.0f\n", i, rd(a), rd(mn), rd(mx));
+        }
     } else if(argc>=3 && !strcmp(argv[1],"read")){
         uint32_t type,size; uint8_t buf[32];
         if(smc_read(argv[2],&type,&size,buf)){ printf("ERR\n"); rc=1; }
@@ -127,7 +148,7 @@ int main(int argc, char **argv){
         rc = smc_write(argv[2], atof(argv[3]));
         printf("%s <- %s : %s\n", argv[2], argv[3], rc?"FAIL":"ok");
     } else {
-        fprintf(stderr,"usage: smc temp | fans | read <KEY> | set <KEY> <float>\n"); rc=2;
+        fprintf(stderr,"usage: smc temp|tempraw|fans|fanstat | get <KEY> | read <KEY> | set <KEY> <float>\n"); rc=2;
     }
     smc_close();
     return rc;
