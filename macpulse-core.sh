@@ -151,6 +151,39 @@ PLIST
   echo "installed"
 }
 
+thermal_install() {
+  # $2 = thermal.sh source, $3 = prebuilt smc binary source
+  T_SRC="${2:?thermal source path required}"
+  SMC_SRC="${3:?smc source path required}"
+  T_LABEL="com.macpulse.thermal"
+  T_PLIST="/Library/LaunchDaemons/${T_LABEL}.plist"
+  mkdir -p "$SUPPORT_DIR"
+  cp "$T_SRC" "$SUPPORT_DIR/thermal.sh"
+  [ -f "$SMC_SRC" ] && cp "$SMC_SRC" "$SUPPORT_DIR/smc"
+  chown root:wheel "$SUPPORT_DIR/thermal.sh" "$SUPPORT_DIR/smc" 2>/dev/null
+  chmod 755 "$SUPPORT_DIR/thermal.sh" "$SUPPORT_DIR/smc" 2>/dev/null
+  cat > "$T_PLIST" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+ "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>${T_LABEL}</string>
+  <key>ProgramArguments</key>
+  <array><string>/bin/zsh</string><string>${SUPPORT_DIR}/thermal.sh</string></array>
+  <key>StartInterval</key><integer>10</integer>
+  <key>RunAtLoad</key><true/>
+  <key>ProcessType</key><string>Background</string>
+  <key>LowPriorityIO</key><true/>
+  <key>Nice</key><integer>10</integer>
+</dict></plist>
+PLIST
+  chown root:wheel "$T_PLIST"; chmod 644 "$T_PLIST"
+  launchctl bootout "system/${T_LABEL}" 2>/dev/null
+  launchctl bootstrap system "$T_PLIST"
+  launchctl kickstart -k "system/${T_LABEL}" 2>/dev/null
+  echo "thermal-installed"
+}
+
 guard_remove() {
   launchctl bootout "system/${DAEMON_LABEL}" 2>/dev/null
   launchctl bootout "system/${AGENT_LABEL}" 2>/dev/null
@@ -166,5 +199,6 @@ case "$MODE" in
   tune)          tune ;;
   guard-install) guard_install "$@" ;;
   guard-remove)  guard_remove ;;
-  *) echo "Usage: $0 {audit|deep <out>|tune|guard-install <src>|guard-remove}" ;;
+  thermal-install) thermal_install "$@" ;;
+  *) echo "Usage: $0 {audit|deep <out>|tune|guard-install <src>|guard-remove|thermal-install <thermal> <smc>}" ;;
 esac

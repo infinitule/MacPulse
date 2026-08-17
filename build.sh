@@ -5,14 +5,15 @@ set -e
 cd "$(dirname "$0")"
 
 swiftc -O main.swift -o MacPulse
+clang -O2 -framework IOKit -framework CoreFoundation smc.c -o smc   # SMC helper for the thermal governor
 
 APP="$HOME/Applications/MacPulse.app"
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp MacPulse "$APP/Contents/MacOS/MacPulse"
 cp Info.plist "$APP/Contents/Info.plist"
-cp AppIcon.icns macpulse-core.sh guard-root.sh agent-root.sh "$APP/Contents/Resources/"
-chmod +x "$APP/Contents/Resources/"*.sh
+cp AppIcon.icns macpulse-core.sh guard-root.sh agent-root.sh thermal.sh smc "$APP/Contents/Resources/"
+chmod +x "$APP/Contents/Resources/"*.sh "$APP/Contents/Resources/smc"
 codesign --force --deep -s - "$APP"
 
 echo "Built $APP"

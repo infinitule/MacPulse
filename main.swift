@@ -65,6 +65,22 @@ final class PulseModel: ObservableObject {
     @Published var expanded = false
     @Published var consRuntimeMin: Int? = nil
 
+    // Thermal governor mirror (fed by /Library/Application Support/MacPulse/thermal.json)
+    @Published var thermCpuC: Double = 0
+    @Published var thermFanRpm: Int = 0
+    @Published var thermBand: Int = 0            // 0 COOL · 1 WARM · 2 HOT · 3 CRIT
+    @Published var thermBandName: String = "—"
+    @Published var thermThrottling = false
+    @Published var thermSpeedLimit: Int = 100
+    @Published var thermHog: String = ""
+    @Published var thermAdvice: String = ""
+    @Published var fanControlAvailable = false
+    @Published var fanControlReason: String = ""
+
+    // Render self-limit: drop the live desktop blur when hot (band ≥ 2) or on
+    // battery. This is the app's own contribution to cooling the machine.
+    var cheapGlass: Bool { thermBand >= 2 || onBattery }
+
     var expandRequest: ((Bool) -> Void)?
 
     // Kalman filter (local linear trend) mirroring the guard daemon:
@@ -88,6 +104,36 @@ final class PulseModel: ObservableObject {
         if let i = Int64(s) { return i }
         if let u = UInt64(s) { return Int64(bitPattern: u) }
         return 0
+    }
+
+    // Decoded shape of thermal.json written by the root governor (thermal.sh).
+    private struct ThermalJSON: Decodable {
+        struct Hog: Decodable { let name: String; let cpu: Double }
+        let cpu_c: Double; let fan_rpm: Double
+        let speed_limit: Int; let throttling: Bool
+        let band: Int; let band_name: String
+        let fan_control: Bool; let fan_reason: String
+        let hog: Hog; let advice: String
+    }
+
+    // Read the governor's latest sample (cheap: a small local file). Publishes
+    // on the main thread. Silent no-op until the governor is installed.
+    func readThermal() {
+        let path = "/Library/Application Support/MacPulse/thermal.json"
+        guard let data = FileManager.default.contents(atPath: path),
+              let t = try? JSONDecoder().decode(ThermalJSON.self, from: data) else { return }
+        DispatchQueue.main.async {
+            self.thermCpuC = t.cpu_c
+            self.thermFanRpm = Int(t.fan_rpm.rounded())
+            self.thermSpeedLimit = t.speed_limit
+            self.thermThrottling = t.throttling
+            self.thermBand = t.band
+            self.thermBandName = t.band_name
+            self.thermHog = t.hog.cpu > 0 ? "\(t.hog.name) \(Int(t.hog.cpu))%" : t.hog.name
+            self.thermAdvice = t.advice
+            self.fanControlAvailable = t.fan_control
+            self.fanControlReason = t.fan_reason
+        }
     }
 
     func refresh() {
@@ -149,10 +195,35 @@ final class PulseModel: ObservableObject {
                 hogText = "\(name) \(Int(cpu))%"
             }
 
+            // Thermal (non-root): band from kernel thermal-pressure level, throttle
+            // from pmset -g therm. These need no daemon — the governor's thermal.json
+            // only *enriches* this with real °C/RPM when installed.
+            let levelStr = runShell(["/usr/sbin/sysctl", "-n", "machdep.xcpm.cpu_thermal_level"]).out
+            let thermLevel = Int(levelStr.trimmingCharacters(in: .whitespacesAndNewlines)) ?? 0
+            let thermOut = runShell(["/usr/bin/pmset", "-g", "therm"]).out
+            var speedLimit = 100
+            if let r = thermOut.range(of: "CPU_Speed_Limit[^0-9]*[0-9]+", options: .regularExpression) {
+                speedLimit = Int(thermOut[r].filter { $0.isNumber }) ?? 100
+            }
+            let uBand = thermLevel >= 118 ? 3 : thermLevel >= 108 ? 2 : thermLevel >= 95 ? 1 : 0
+
             let g = FileManager.default.fileExists(atPath: "/Library/LaunchDaemons/com.macpulse.guard.plist")
             let l = FileManager.default.fileExists(atPath: self.loginAgent)
 
             DispatchQueue.main.async {
+                // Base thermal state from live non-root signals (always available).
+                let names = ["COOL", "WARM", "HOT", "CRIT"]
+                self.thermSpeedLimit = speedLimit
+                self.thermThrottling = speedLimit < 100
+                self.thermBand = uBand
+                self.thermBandName = names[uBand]
+                self.thermHog = hogText ?? ""
+                switch uBand {
+                case 0: self.thermAdvice = "Thermals nominal."
+                case 1: self.thermAdvice = "Warming. MacPulse is easing its own render."
+                case 2: self.thermAdvice = "Hot — compositing load high. Top source: \(hogText ?? "—"). Close heavy GPU tabs."
+                default: self.thermAdvice = "CRITICAL — at throttle threshold. Biggest source: \(hogText ?? "—"). Quit or pause it."
+                }
                 // Chance-constrained runtime bound (same math as the daemon):
                 // 60E / (P_forecast + 1.645 sigma), sigma from Kalman covariance
                 var cons: Int? = nil
@@ -223,6 +294,9 @@ final class PulseModel: ObservableObject {
                     self.guardOn = g
                     self.loginOn = l
                 }
+                // Enrich with the governor's real °C/RPM when the daemon is installed;
+                // otherwise the non-root band above stands on its own.
+                self.readThermal()
             }
         }
     }
@@ -297,6 +371,24 @@ final class PulseModel: ObservableObject {
             Thread.sleep(forTimeInterval: 0.4)
         }
         return nil
+    }
+
+    // MARK: thermal governor (real °C/RPM daemon; band works without it)
+
+    func thermalInstalled() -> Bool {
+        FileManager.default.fileExists(atPath: "/Library/LaunchDaemons/com.macpulse.thermal.plist")
+    }
+
+    // One OS admin prompt installs the °C-sensor daemon. The band/throttle/hog
+    // readout already works from non-root signals; this just adds real °C + RPM.
+    func installThermal() {
+        run("Enabling °C sensor…") {
+            let core = resourcePath("macpulse-core")
+            let thermal = resourcePath("thermal")
+            let smc = Bundle.main.path(forResource: "smc", ofType: nil) ?? "\(self.spool)/../smc"
+            let r = runAdmin("/bin/zsh '\(core)' thermal-install '\(thermal)' '\(smc)'")
+            self.flash(r.code == 0 ? "Live °C sensor enabled" : "Sensor install canceled")
+        }
     }
 
     func audit() {
@@ -417,18 +509,32 @@ final class PulseModel: ObservableObject {
 // NSVisualEffectView with .behindWindow is what actually samples the desktop.
 struct GlassBackdrop: NSViewRepresentable {
     var material: NSVisualEffectView.Material = .hudWindow
+    // Thermal self-limit: `.active` continuously re-samples the desktop behind
+    // the panel every frame — that live blur is what pins the iGPU and inflates
+    // WindowServer. When the machine is hot or on battery we switch to
+    // `.inactive`, which freezes sampling (the glass stops chasing the desktop)
+    // and costs almost nothing. The app thus stops being its own heat source
+    // exactly when heat matters.
+    var cheap: Bool = false
 
     func makeNSView(context: Context) -> NSVisualEffectView {
         let v = NSVisualEffectView()
-        v.material = material
-        v.blendingMode = .behindWindow
-        v.state = .active
-        v.isEmphasized = true
+        apply(v)
         return v
     }
 
     func updateNSView(_ v: NSVisualEffectView, context: Context) {
-        v.material = material
+        apply(v)
+    }
+
+    // Cheap mode keeps compositing ACTIVE (so nothing ghosts) but blends
+    // within-window instead of behind-window — that drops the continuous
+    // desktop sampling that pins the iGPU, which was the real heat cost.
+    private func apply(_ v: NSVisualEffectView) {
+        v.material = cheap ? .windowBackground : material
+        v.blendingMode = cheap ? .withinWindow : .behindWindow
+        v.state = .active
+        v.isEmphasized = !cheap
     }
 }
 
@@ -502,6 +608,9 @@ struct StatCell: View {
                 .font(.system(size: 9, weight: .medium))
                 .foregroundColor(.primary.opacity(0.42))
                 .lineLimit(1)
+                .truncationMode(.tail)
+                .minimumScaleFactor(0.8)
+                .padding(.horizontal, 4)
         }
         .frame(maxWidth: .infinity)
         .padding(.vertical, 10)
@@ -670,8 +779,10 @@ struct IslandView: View {
         }
         .background(
             ZStack {
-                // 1. real behind-window blur — samples the desktop underneath
-                GlassBackdrop()
+                // 1. real behind-window blur — samples the desktop underneath.
+                //    Freezes to a cheap static blur when hot/on battery so the
+                //    island stops driving the iGPU it's meant to protect.
+                GlassBackdrop(cheap: model.cheapGlass)
                     .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
                 // 2. adaptive tint: smoked in dark, luminous frost in light
                 RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
@@ -742,7 +853,7 @@ struct IslandView: View {
             switch phase {
             case .active(let loc):
                 let w: CGFloat = model.expanded ? 444 : 300
-                let h: CGFloat = model.expanded ? 330 : 110
+                let h: CGFloat = model.expanded ? 430 : 110
                 hoverPoint = CGPoint(x: loc.x / w, y: loc.y / h)
             case .ended:
                 hoverPoint = nil
@@ -785,6 +896,18 @@ struct IslandView: View {
                     .font(.system(size: 10.5, weight: .semibold))
                     .foregroundColor(Color.green.opacity(0.9))
             }
+            if model.thermBand >= 1 || model.thermThrottling {
+                dot
+                Image(systemName: model.thermThrottling ? "flame.fill" : "thermometer.medium")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundColor(bandColor)
+                if model.thermCpuC > 0 {
+                    Text("\(Int(model.thermCpuC))°")
+                        .font(.system(size: 13, weight: .semibold).monospacedDigit())
+                        .foregroundColor(bandColor)
+                        .contentTransition(.numericText())
+                }
+            }
         }
         .padding(.horizontal, 17)
         .padding(.vertical, 11)
@@ -800,6 +923,87 @@ struct IslandView: View {
         Circle()
             .fill(Color.white.opacity(0.25))
             .frame(width: 3.5, height: 3.5)
+    }
+
+    // Thermal band → colour. 0 cool green · 1 warm yellow · 2 hot orange · 3 crit red.
+    private var bandColor: Color {
+        switch model.thermBand {
+        case 3: return Color(red: 1.0, green: 0.30, blue: 0.28)
+        case 2: return Color(red: 1.0, green: 0.55, blue: 0.15)
+        case 1: return Color(red: 1.0, green: 0.80, blue: 0.25)
+        default: return Color(red: 0.30, green: 0.80, blue: 0.45)
+        }
+    }
+
+    // Multi-band thermal readout — the governor's live state, T2-honest.
+    private var thermalCard: some View {
+        VStack(alignment: .leading, spacing: 7) {
+            HStack(spacing: 8) {
+                Image(systemName: model.thermThrottling ? "flame.fill" : "thermometer.medium")
+                    .font(.system(size: 12, weight: .bold))
+                    .foregroundColor(bandColor)
+                Text("THERMAL")
+                    .font(.system(size: 10, weight: .heavy)).tracking(1.4)
+                    .foregroundColor(.secondary)
+                Text(model.thermBandName)
+                    .font(.system(size: 10, weight: .heavy)).tracking(1)
+                    .foregroundColor(.black.opacity(0.85))
+                    .padding(.horizontal, 7).padding(.vertical, 2)
+                    .background(Capsule().fill(bandColor.opacity(0.95)))
+                Spacer()
+                if model.thermThrottling {
+                    Text("THROTTLING \(model.thermSpeedLimit)%")
+                        .font(.system(size: 9, weight: .heavy)).tracking(0.5)
+                        .foregroundColor(Color(red: 1.0, green: 0.30, blue: 0.28))
+                }
+            }
+            HStack(alignment: .firstTextBaseline, spacing: 14) {
+                bandStat(model.thermCpuC > 0 ? "\(Int(model.thermCpuC))°" : "—", "CPU DIE")
+                bandStat(model.thermFanRpm > 0 ? "\(model.thermFanRpm)" : "—", "FAN RPM")
+                bandStat("\(model.thermSpeedLimit)%", "CPU SPEED")
+                Spacer()
+            }
+            if !model.thermAdvice.isEmpty {
+                Text(model.thermAdvice)
+                    .font(.system(size: 10.5, weight: .medium))
+                    .foregroundColor(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            if model.thermCpuC == 0 {
+                Button { model.installThermal() } label: {
+                    Label("Enable live °C + fan sensor (one prompt)", systemImage: "thermometer.medium")
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundColor(bandColor)
+                }
+                .buttonStyle(.plain)
+                .disabled(model.busy != nil)
+            }
+            Label("Fans on Apple's curve — direct control blocked by the T2 on this model",
+                  systemImage: "lock.fill")
+                .font(.system(size: 9, weight: .medium))
+                .foregroundColor(.secondary.opacity(0.7))
+                .labelStyle(.titleAndIcon)
+        }
+        .padding(12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .fill(bandColor.opacity(model.thermBand >= 2 ? 0.12 : 0.06))
+                .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .strokeBorder(bandColor.opacity(0.30), lineWidth: 1))
+        )
+    }
+
+    private func bandStat(_ value: String, _ label: String) -> some View {
+        VStack(alignment: .leading, spacing: 1) {
+            Text(value)
+                .font(.system(size: 18, weight: .semibold).monospacedDigit())
+                .foregroundColor(.primary)
+                .contentTransition(.numericText())
+            Text(label)
+                .font(.system(size: 8, weight: .heavy)).tracking(0.8)
+                .foregroundColor(.secondary)
+        }
     }
 
     // MARK: expanded panel
@@ -858,6 +1062,8 @@ struct IslandView: View {
                     sub: model.hog
                 )
             }
+
+            thermalCard
 
             HStack(spacing: 10) {
                 ActionButton(title: "Audit", symbol: "waveform.path.ecg") { model.audit() }
@@ -924,7 +1130,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     var timer: Timer?
 
     private func windowSize(expanded: Bool) -> NSSize {
-        expanded ? NSSize(width: 480, height: 400) : NSSize(width: 360, height: 105)
+        expanded ? NSSize(width: 480, height: 500) : NSSize(width: 360, height: 105)
     }
 
     private func initialFrame() -> NSRect {
@@ -981,13 +1187,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         model.refresh()
-        timer = Timer.scheduledTimer(withTimeInterval: 6, repeats: true) { [weak self] _ in
+        rearmTimer()
+    }
+
+    // Adaptive cadence: poll briskly while the panel is open, lazily while it's
+    // a pill. Fewer shell spawns/re-renders when idle = less periodic heat.
+    private func rearmTimer() {
+        timer?.invalidate()
+        let interval: TimeInterval = model.expanded ? 5 : 14
+        timer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
             self?.model.refresh()
         }
     }
 
     func setExpanded(_ expanded: Bool) {
         guard model.expanded != expanded else { return }
+        if expanded { model.refresh() }   // fresh numbers the instant it opens
+        defer { rearmTimer() }            // follow the new cadence
         let current = panel.frame
         let size = windowSize(expanded: expanded)
         let newFrame = NSRect(
