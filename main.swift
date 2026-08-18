@@ -129,10 +129,24 @@ final class PulseModel: ObservableObject {
             self.thermFanRpm = Int(t.fan_rpm.rounded())
             self.thermSpeedLimit = t.speed_limit
             self.thermThrottling = t.throttling
-            self.thermBand = t.band
-            self.thermBandName = t.band_name
+            // Enrichment must never DOWNGRADE severity: the daemon bands on die
+            // temp, but chassis/battery heat can clamp the CPU hard while the
+            // die stays cool (fast-charging under load). Keep the worse of the
+            // two signals; an active clamp below 70% speed is CRIT by definition.
+            let names = ["COOL", "WARM", "HOT", "CRIT"]
+            var band = max(t.band, self.thermBand)
+            if t.throttling && t.speed_limit < 70 { band = 3 }
+            self.thermBand = band
+            self.thermBandName = names[band]
             self.thermHog = t.hog.cpu > 0 ? "\(t.hog.name) \(Int(t.hog.cpu))%" : t.hog.name
-            self.thermAdvice = t.advice
+            if t.throttling && t.speed_limit < 70 && t.cpu_c > 0 && t.cpu_c < 70 {
+                // Chassis-heat throttle: die cool yet clamped — die-temp advice
+                // from the daemon would mislead here.
+                self.thermAdvice = "Throttled to \(t.speed_limit)% by chassis/battery heat, not the CPU "
+                    + "— likely fast-charging under load. Finish charging or use a right-side port."
+            } else {
+                self.thermAdvice = t.advice
+            }
             self.fanControlAvailable = t.fan_control
             self.fanControlReason = t.fan_reason
             self.thermFanFloor = Int((t.fan_floor ?? 0).rounded())
